@@ -56,6 +56,7 @@ def check_libflex():
 ROOT_DIR = Path(__file__).absolute().parent
 CSRC_DIR = ROOT_DIR / PATH_NAME / "csrc"
 DISTRIBUTED_SRC_DIR = CSRC_DIR / "distributed"
+PROFILER_SRC_DIR = CSRC_DIR / "profiler"
 
 
 # Automatically download json.hpp if not present
@@ -214,11 +215,12 @@ if __name__ == "__main__":
         from torch.utils.cpp_extension import BuildExtension, CppExtension
 
         sources = list(CSRC_DIR.glob("*.cpp"))
+        profiler_sources = list(PROFILER_SRC_DIR.glob("*.cpp"))
         distributed_sources = (
             list(DISTRIBUTED_SRC_DIR.glob("*.cpp")) if use_spyre_ccl else []
         )
 
-        core_src_paths = [p.relative_to(ROOT_DIR).as_posix() for p in sorted(sources)]
+        core_src_paths = [p.relative_to(ROOT_DIR).as_posix() for p in sorted(sources + profiler_sources)]
         distributed_src_paths = [
             p.relative_to(ROOT_DIR).as_posix() for p in sorted(distributed_sources)
         ]
