@@ -285,7 +285,7 @@ def _jsonable(o):
 def ops_to_json(ops: list) -> str:
     """Serialize a fused bundle (list of OpFeatures) to a single JSON string. Sizes coming
     off the IR are often sympy ``Integer``, so a ``default`` coercer is required."""
-    import json
+    from torch_spyre import _json as json
 
     return json.dumps(
         [op_to_dict(o) for o in ops], separators=(",", ":"), default=_jsonable
@@ -294,7 +294,7 @@ def ops_to_json(ops: list) -> str:
 
 def ops_from_json(s: str) -> list:
     """Deserialize a bundle serialized by :func:`ops_to_json`."""
-    import json
+    from torch_spyre import _json as json
 
     return [op_from_dict(d) for d in json.loads(s)]
 

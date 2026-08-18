@@ -29,7 +29,6 @@ Usage:
 
 import functools
 import itertools
-import json
 import logging
 import os
 import platform
@@ -43,6 +42,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
 from weakref import WeakSet
+
+from torch_spyre import _json as json
 
 
 T = TypeVar("T")

@@ -31,8 +31,9 @@ from __future__ import annotations
 import base64
 import dataclasses
 import hashlib
-import json
 from collections.abc import Iterator, Mapping, Sequence
+
+from torch_spyre import _json as json
 
 import sympy
 

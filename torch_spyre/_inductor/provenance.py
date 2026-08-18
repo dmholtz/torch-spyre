@@ -23,8 +23,9 @@ reads a ``ComputedBuffer``'s ``origins`` to construct the handle.
 from __future__ import annotations
 
 import hashlib
-import json
 from typing import Any, Sequence
+
+from torch_spyre import _json as json
 
 import regex
 
