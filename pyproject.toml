@@ -25,6 +25,7 @@ description = "Torch-Spyre out of tree registration"
 dependencies = [
     "numpy",
     "regex",
+    "pysimdjson",
     "torch~=2.13.0",
 #    "torch>=2.13.0",
     "psutil"
