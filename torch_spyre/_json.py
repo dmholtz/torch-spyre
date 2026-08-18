@@ -14,7 +14,7 @@
 
 import dataclasses
 import functools
-import json as _std_json
+import simdjson as _std_json
 import threading
 import time
 from typing import Any, Callable
@@ -55,12 +55,6 @@ load = _instrument("load", _std_json.load)
 loads = _instrument("loads", _std_json.loads)
 dump = _instrument("dump", _std_json.dump)
 dumps = _instrument("dumps", _std_json.dumps)
-
-# Expose remaining attributes from standard json module
-JSONDecodeError = _std_json.JSONDecodeError
-JSONDecoder = _std_json.JSONDecoder
-JSONEncoder = _std_json.JSONEncoder
-
 
 def print_json_statistics() -> None:
     """Print the global statistics for json load, loads, dump, and dumps calls."""
