@@ -22,7 +22,7 @@ import torch
 from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
 from . import memory
 from . import profiler
-from ._json import print_json_statistics, reset_json_statistics
+from ._json import get_json_statistics, print_json_statistics, reset_json_statistics
 
 
 _runtime_init_lock = threading.Lock()

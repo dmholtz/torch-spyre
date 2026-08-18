@@ -197,4 +197,14 @@ std::unique_ptr<JobPlan> prepareKernel(
     const std::string& spyrecode_dir, const SpyreStream* stream = nullptr,
     std::optional<std::string> profiler_name = std::nullopt);
 
+struct CppJsonStats {
+  uint64_t parse_calls;
+  double parse_time_seconds;
+  uint64_t file_read_calls;
+  double file_read_time_seconds;
+};
+
+CppJsonStats getCppJsonStatistics();
+void resetCppJsonStatistics();
+
 }  // namespace spyre

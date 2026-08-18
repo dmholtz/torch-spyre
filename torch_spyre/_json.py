@@ -98,30 +98,84 @@ dump = _instrument("dump", _dump_adapter)
 dumps = _instrument("dumps", _dumps_adapter)
 
 
-def print_json_statistics() -> None:
-    """Print the global statistics for json load, loads, dump, and dumps calls."""
+def get_json_statistics() -> dict[str, dict[str, Any]]:
+    """Return a dictionary containing both Python frontend and C++ backend JSON metrics."""
     with _lock:
-        snapshot = {name: (stat.calls, stat.total_time_seconds) for name, stat in _stats.items()}
+        py_snapshot = {
+            name: {"calls": stat.calls, "total_time_seconds": stat.total_time_seconds}
+            for name, stat in _stats.items()
+        }
 
-    print("=" * 60)
-    print(f"{'JSON Function':<15} {'Calls':<12} {'Total Time (s)':<18} {'Avg Time (ms)':<15}")
-    print("-" * 60)
-    total_calls = 0
-    total_time = 0.0
-    for name, (calls, time_sec) in snapshot.items():
-        total_calls += calls
-        total_time += time_sec
+    cpp_stats = {}
+    try:
+        from torch_spyre import _C
+
+        if hasattr(_C, "_get_cpp_json_statistics"):
+            cpp_stats = _C._get_cpp_json_statistics()
+    except Exception:
+        pass
+
+    return {
+        "python": py_snapshot,
+        "cpp": cpp_stats,
+    }
+
+
+def print_json_statistics() -> None:
+    """Print the global statistics for Python and C++ JSON operations."""
+    stats = get_json_statistics()
+    py_snapshot = stats["python"]
+    cpp_snapshot = stats["cpp"]
+
+    print("=" * 65)
+    print(f"{'Python JSON Function':<22} {'Calls':<10} {'Total Time (s)':<18} {'Avg Time (ms)':<15}")
+    print("-" * 65)
+    py_total_calls = 0
+    py_total_time = 0.0
+    for name, data in py_snapshot.items():
+        calls = data["calls"]
+        time_sec = data["total_time_seconds"]
+        py_total_calls += calls
+        py_total_time += time_sec
         avg_ms = (time_sec / calls * 1000.0) if calls > 0 else 0.0
-        print(f"{name:<15} {calls:<12} {time_sec:<18.6f} {avg_ms:<15.4f}")
-    print("-" * 60)
-    total_avg_ms = (total_time / total_calls * 1000.0) if total_calls > 0 else 0.0
-    print(f"{'Total':<15} {total_calls:<12} {total_time:<18.6f} {total_avg_ms:<15.4f}")
-    print("=" * 60)
+        print(f"{name:<22} {calls:<10} {time_sec:<18.6f} {avg_ms:<15.4f}")
+    print("-" * 65)
+    py_avg_ms = (py_total_time / py_total_calls * 1000.0) if py_total_calls > 0 else 0.0
+    print(f"{'Python Total':<22} {py_total_calls:<10} {py_total_time:<18.6f} {py_avg_ms:<15.4f}")
+
+    if cpp_snapshot:
+        print("=" * 65)
+        print(f"{'C++ JSON Operation':<22} {'Calls':<10} {'Total Time (s)':<18} {'Avg Time (ms)':<15}")
+        print("-" * 65)
+        parse_calls = cpp_snapshot.get("parse_calls", 0)
+        parse_time = cpp_snapshot.get("parse_time_seconds", 0.0)
+        parse_avg_ms = (parse_time / parse_calls * 1000.0) if parse_calls > 0 else 0.0
+        print(f"{'spyrecode.json parse':<22} {parse_calls:<10} {parse_time:<18.6f} {parse_avg_ms:<15.4f}")
+
+        read_calls = cpp_snapshot.get("file_read_calls", 0)
+        read_time = cpp_snapshot.get("file_read_time_seconds", 0.0)
+        read_avg_ms = (read_time / read_calls * 1000.0) if read_calls > 0 else 0.0
+        print(f"{'spyrecode.json read':<22} {read_calls:<10} {read_time:<18.6f} {read_avg_ms:<15.4f}")
+
+        cpp_total_calls = parse_calls + read_calls
+        cpp_total_time = parse_time + read_time
+        cpp_avg_ms = (cpp_total_time / cpp_total_calls * 1000.0) if cpp_total_calls > 0 else 0.0
+        print("-" * 65)
+        print(f"{'C++ Total':<22} {cpp_total_calls:<10} {cpp_total_time:<18.6f} {cpp_avg_ms:<15.4f}")
+
+    print("=" * 65)
 
 
 def reset_json_statistics() -> None:
-    """Reset all json metrics counters."""
+    """Reset all Python and C++ json metrics counters."""
     with _lock:
         for stat in _stats.values():
             stat.calls = 0
             stat.total_time_seconds = 0.0
+    try:
+        from torch_spyre import _C
+
+        if hasattr(_C, "_reset_cpp_json_statistics"):
+            _C._reset_cpp_json_statistics()
+    except Exception:
+        pass

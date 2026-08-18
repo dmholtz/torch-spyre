@@ -16,6 +16,8 @@
 
 #include "prepare_kernel.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -33,6 +35,29 @@
 #include "spyrecode-host-functions/spyrecode.h"
 
 namespace spyre {
+
+static std::atomic<uint64_t> g_cpp_json_parse_calls{0};
+static std::atomic<uint64_t> g_cpp_json_parse_time_ns{0};
+static std::atomic<uint64_t> g_cpp_json_file_read_calls{0};
+static std::atomic<uint64_t> g_cpp_json_file_read_time_ns{0};
+
+CppJsonStats getCppJsonStatistics() {
+  CppJsonStats stats;
+  stats.parse_calls = g_cpp_json_parse_calls.load(std::memory_order_relaxed);
+  stats.parse_time_seconds =
+      static_cast<double>(g_cpp_json_parse_time_ns.load(std::memory_order_relaxed)) / 1e9;
+  stats.file_read_calls = g_cpp_json_file_read_calls.load(std::memory_order_relaxed);
+  stats.file_read_time_seconds =
+      static_cast<double>(g_cpp_json_file_read_time_ns.load(std::memory_order_relaxed)) / 1e9;
+  return stats;
+}
+
+void resetCppJsonStatistics() {
+  g_cpp_json_parse_calls.store(0, std::memory_order_relaxed);
+  g_cpp_json_parse_time_ns.store(0, std::memory_order_relaxed);
+  g_cpp_json_file_read_calls.store(0, std::memory_order_relaxed);
+  g_cpp_json_file_read_time_ns.store(0, std::memory_order_relaxed);
+}
 
 /**
  * @brief Enum for SpyreCode command types
@@ -229,14 +254,26 @@ JobPlanBuilder::JobPlanBuilder(const std::string& spyrecode_dir,
               "Required file spyrecode.json not found in directory: ",
               spyrecode_dir_.string());
 
+  auto read_start = std::chrono::high_resolution_clock::now();
   std::string json_str = read_file_to_string(spyrecode_json_path);
+  auto read_end = std::chrono::high_resolution_clock::now();
+  g_cpp_json_file_read_calls.fetch_add(1, std::memory_order_relaxed);
+  g_cpp_json_file_read_time_ns.fetch_add(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(read_end - read_start).count(),
+      std::memory_order_relaxed);
 
+  auto parse_start = std::chrono::high_resolution_clock::now();
   try {
     spyrecode_json_ = nlohmann::json::parse(json_str);
   }
   catch (const std::exception& e) {
     TORCH_CHECK(false, "Failed to parse spyrecode.json: ", e.what());
   }
+  auto parse_end = std::chrono::high_resolution_clock::now();
+  g_cpp_json_parse_calls.fetch_add(1, std::memory_order_relaxed);
+  g_cpp_json_parse_time_ns.fetch_add(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(parse_end - parse_start).count(),
+      std::memory_order_relaxed);
 
   // Validate required fields
   TORCH_CHECK(spyrecode_json_.contains("JobPreparationPlan"),

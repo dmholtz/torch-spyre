@@ -536,6 +536,16 @@ PYBIND11_MODULE(_C, m) {
         "profiler-visible compute events. Defaults to None.\n\n"
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
+  m.def("_get_cpp_json_statistics", []() {
+    auto stats = spyre::getCppJsonStatistics();
+    py::dict res;
+    res["parse_calls"] = stats.parse_calls;
+    res["parse_time_seconds"] = stats.parse_time_seconds;
+    res["file_read_calls"] = stats.file_read_calls;
+    res["file_read_time_seconds"] = stats.file_read_time_seconds;
+    return res;
+  });
+  m.def("_reset_cpp_json_statistics", &spyre::resetCppJsonStatistics);
   // Bind the current-stream overload (resolves the current stream internally).
   m.def("launch_jobplan",
         static_cast<void (*)(const spyre::JobPlan&,
