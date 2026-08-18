@@ -14,10 +14,11 @@
 
 import dataclasses
 import functools
-import simdjson as _std_json
 import threading
 import time
 from typing import Any, Callable
+
+import orjson
 
 
 @dataclasses.dataclass
@@ -51,10 +52,51 @@ def _instrument(name: str, fn: Callable) -> Callable:
     return wrapper
 
 
-load = _instrument("load", _std_json.load)
-loads = _instrument("loads", _std_json.loads)
-dump = _instrument("dump", _std_json.dump)
-dumps = _instrument("dumps", _std_json.dumps)
+def _loads_adapter(s: str | bytes, *args: Any, **kwargs: Any) -> Any:
+    return orjson.loads(s)
+
+
+def _dumps_adapter(
+    obj: Any,
+    *args: Any,
+    indent: int | None = None,
+    default: Callable[[Any], Any] | None = None,
+    sort_keys: bool = False,
+    **kwargs: Any,
+) -> str:
+    option = 0
+    if indent:
+        option |= orjson.OPT_INDENT_2
+    if sort_keys:
+        option |= orjson.OPT_SORT_KEYS
+
+    b = orjson.dumps(obj, default=default, option=option if option else None)
+    return b.decode("utf-8")
+
+
+def _dump_adapter(
+    obj: Any,
+    fp: Any,
+    *args: Any,
+    indent: int | None = None,
+    default: Callable[[Any], Any] | None = None,
+    sort_keys: bool = False,
+    **kwargs: Any,
+) -> None:
+    s = _dumps_adapter(obj, *args, indent=indent, default=default, sort_keys=sort_keys, **kwargs)
+    fp.write(s)
+
+
+def _load_adapter(fp: Any, *args: Any, **kwargs: Any) -> Any:
+    content = fp.read()
+    return _loads_adapter(content)
+
+
+load = _instrument("load", _load_adapter)
+loads = _instrument("loads", _loads_adapter)
+dump = _instrument("dump", _dump_adapter)
+dumps = _instrument("dumps", _dumps_adapter)
+
 
 def print_json_statistics() -> None:
     """Print the global statistics for json load, loads, dump, and dumps calls."""
