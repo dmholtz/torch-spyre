@@ -637,7 +637,7 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
       // Step 1: D2H — read the current full allocation into a CPU buffer.
       alloc_view = at::as_strided(dst, alloc_sizes, alloc_strides,
                                   /*storage_offset=*/0);
-      cpu_alloc = at::empty(alloc_sizes, self.options());
+      cpu_alloc = at::empty(alloc_sizes, self.options().dtype(dst.scalar_type()));
       stream.copyAsync(alloc_view, cpu_alloc);
       stream.synchronize();
       // Step 2: CPU patch — overwrite only the target slot.
@@ -684,7 +684,10 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   }
 
   stream.copyAsync(*copy_from, *copy_to);
-  if (!non_blocking) {
+  if (!non_blocking || (staging && dst.is_cpu())) {
+    // Always synchronize before reading cpu_alloc in the D2H staging path:
+    // copyAsync passes a raw void* and does not retain tensor ownership, so
+    // cpu_alloc must be fully written before we apply the logical view below.
     stream.synchronize();
   }
 
