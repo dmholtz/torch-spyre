@@ -335,14 +335,16 @@ class SuppressSfdpPass(CustomGraphPass):
         sfdp_pass = _jg.pass_patterns[0]
         for key, entries in list(sfdp_pass.patterns.items()):
             if any(
-                getattr(e, "pattern_name", "").startswith("_sfdp_pattern_")
+                (getattr(e, "pattern_name", "") or "").startswith("_sfdp_pattern_")
                 for e in entries
             ):
                 self.snapshot[key] = list(entries)
                 remaining = [
                     e
                     for e in entries
-                    if not getattr(e, "pattern_name", "").startswith("_sfdp_pattern_")
+                    if not (getattr(e, "pattern_name", "") or "").startswith(
+                        "_sfdp_pattern_"
+                    )
                 ]
                 if remaining:
                     sfdp_pass.patterns[key] = remaining
