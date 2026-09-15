@@ -8713,6 +8713,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             fn, query, query_idx, k_pages, page_idx, atol=0.2, rtol=0.2, run_eager=False
         )
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_manual_masked_attention_one_graph_4526(self):
         """Regression test for issue #4526: manual matmul+mask+softmax+matmul in one
         compiled graph must honour the additive attn_mask.

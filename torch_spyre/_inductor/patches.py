@@ -74,51 +74,16 @@ def enable_spyre_context(example_inputs: list[InputType]):
         CustomPreFusionPasses,
         CustomPostFusionPasses,
         CustomPreSchedulingPasses,
+        SuppressSfdpPass,
     )
     from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
-    # Snapshot dict shared between the joint_custom_pre_pass closure (which does
-    # the lazy remove after lazy_init runs) and the finally-block restore.
-    from torch._inductor.pattern_matcher import PatternEntry
-
-    sfdp_snapshot: dict[
-        tuple[str, torch.fx.node.Target], list[PatternEntry]
-    ] = {}
-    _sfdp_stripped = False
-
-    def _strip_sfdp_from_joint_graph(graph: torch.fx.graph.Graph) -> None:  # noqa: ARG001
-        """Remove SFDP entries from pass_patterns[0] on the first invocation.
-
-        joint_custom_pre_pass runs after lazy_init() has populated the SFDP
-        patterns into pass_patterns[0] but before pass_patterns[0].apply() fires,
-        so this is the correct interception point.  The snapshot is restored in
-        the finally block of enable_spyre_context.
-        See: https://github.com/torch-spyre/torch-spyre/issues/4526
-        """
-        nonlocal _sfdp_stripped
-        if _sfdp_stripped:
-            return
-        from torch._inductor.fx_passes import joint_graph as _jg
-
-        sfdp_pass = _jg.pass_patterns[0]
-        for key, entries in list(sfdp_pass.patterns.items()):
-            if any(
-                getattr(e, "pattern_name", "").startswith("_sfdp_pattern_")
-                for e in entries
-            ):
-                sfdp_snapshot[key] = list(entries)
-                remaining = [
-                    e
-                    for e in entries
-                    if not getattr(e, "pattern_name", "").startswith(
-                        "_sfdp_pattern_"
-                    )
-                ]
-                if remaining:
-                    sfdp_pass.patterns[key] = remaining
-                else:
-                    del sfdp_pass.patterns[key]
-        _sfdp_stripped = True
+    # A fresh SuppressSfdpPass instance per context invocation: it lazily
+    # strips SFDP entries from pass_patterns[0] on its first __call__ (which
+    # fires inside joint_graph_passes, after lazy_init() has populated the
+    # entries but before pass_patterns[0].apply() runs), and its .snapshot
+    # dict is read by the finally block below to restore those entries on exit.
+    suppress_sfdp = SuppressSfdpPass()
 
     # *) Inductor config tweaks (saved/restored)
     new_config = {
@@ -129,7 +94,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         "post_grad_custom_post_pass": CustomPostPasses(),
         "_pre_fusion_custom_pass": CustomPreFusionPasses(),
         "_post_fusion_custom_pass": CustomPostFusionPasses(),
-        "joint_custom_pre_pass": _strip_sfdp_from_joint_graph,
+        "joint_custom_pre_pass": suppress_sfdp,
         # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
         # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
         "unroll_reductions_threshold": 1,
@@ -151,8 +116,8 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # pass_patterns[1] holds the mul/div softmax stability patterns, unsupported
     # on Spyre. Remove it for the duration of this context.
     # SFDP patterns in pass_patterns[0] are suppressed lazily via
-    # joint_custom_pre_pass (_strip_sfdp_from_joint_graph), which runs after
-    # lazy_init() has populated them but before pass_patterns[0].apply() fires.
+    # joint_custom_pre_pass (SuppressSfdpPass), which runs after lazy_init() has
+    # populated them but before pass_patterns[0].apply() fires.
     joint_graph.pass_patterns.pop()
 
     old_update_scheduler = GraphLowering._update_scheduler
@@ -218,7 +183,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
             yield
         finally:
             joint_graph.pass_patterns[:] = origin_pass
-            for key, entries in sfdp_snapshot.items():
+            for key, entries in suppress_sfdp.snapshot.items():
                 joint_graph.pass_patterns[0].patterns[key] = entries
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]

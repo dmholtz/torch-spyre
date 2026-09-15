@@ -299,6 +299,61 @@ class CustomPostFusionPasses(_SpyreNodePassPipeline):
         )
 
 
+class SuppressSfdpPass(CustomGraphPass):
+    """Removes SFDP attention-fusion entries from joint_graph.pass_patterns[0].
+
+    Inductor's SFDP fusion rewrites (fuse_attention.py, patterns 1–30) are
+    registered lazily into pass_patterns[0] by lazy_init() inside
+    joint_graph_passes().  Several no-mask inference variants (e.g.
+    _sfdp_pattern_2_half_inference) carry no _users constraint on the
+    scaled-scores node and therefore match masked manual-attention graphs
+    (matmul → mul → add(mask) → softmax → matmul), replacing them with
+    aten.scaled_dot_product_attention(..., attn_mask=None) and silently
+    discarding the mask.  Spyre handles every SDPA call through
+    spyre__sdpa_overrideable, so the SFDP rewrite yields no benefit and must
+    not run.
+
+    This pass is registered as joint_custom_pre_pass, which Inductor calls
+    after lazy_init() has populated the entries but before pass_patterns[0]
+    .apply() fires — the only correct interception point.  Affected buckets
+    are snapshotted and restored by enable_spyre_context on context exit.
+
+    See: https://github.com/torch-spyre/torch-spyre/issues/4526
+    """
+
+    def __init__(self) -> None:
+        # Populated on the first __call__; read by enable_spyre_context for
+        # the restore.
+        self.snapshot: dict = {}
+        self._stripped = False
+
+    def __call__(self, graph: torch.fx.graph.Graph) -> None:  # noqa: ARG002
+        if self._stripped:
+            return
+        from torch._inductor.fx_passes import joint_graph as _jg
+
+        sfdp_pass = _jg.pass_patterns[0]
+        for key, entries in list(sfdp_pass.patterns.items()):
+            if any(
+                getattr(e, "pattern_name", "").startswith("_sfdp_pattern_")
+                for e in entries
+            ):
+                self.snapshot[key] = list(entries)
+                remaining = [
+                    e
+                    for e in entries
+                    if not getattr(e, "pattern_name", "").startswith("_sfdp_pattern_")
+                ]
+                if remaining:
+                    sfdp_pass.patterns[key] = remaining
+                else:
+                    del sfdp_pass.patterns[key]
+        self._stripped = True
+
+    def uuid(self) -> Any | None:
+        return get_hash_for_files((__file__,))
+
+
 # Several pre-scheduling steps are config-gated or need arguments beyond the
 # graph (coarse-tile groups, k-fast ops, a scratchpad allocator). They are
 # wrapped below as uniform Callable[[GraphLowering], None] so the pipeline can
