@@ -85,6 +85,21 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # dict is read by the finally block below to restore those entries on exit.
     suppress_sfdp = SuppressSfdpPass()
 
+    # Compose suppress_sfdp with any existing joint_custom_pre_pass so we do
+    # not silently discard passes registered by the caller.  Inductor's
+    # get_custom_graph_passes() accepts None, a single callable, or a
+    # list/tuple, so prepending into a list covers all cases.
+    from torch._inductor.custom_graph_pass import get_custom_graph_passes
+
+    existing_joint_pre = list(
+        get_custom_graph_passes(torch._inductor.config.joint_custom_pre_pass)
+    )
+    composed_joint_pre_pass: object = (
+        [suppress_sfdp] + existing_joint_pre
+        if existing_joint_pre
+        else suppress_sfdp
+    )
+
     # *) Inductor config tweaks (saved/restored)
     new_config = {
         "split_reductions": False,
@@ -94,7 +109,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         "post_grad_custom_post_pass": CustomPostPasses(),
         "_pre_fusion_custom_pass": CustomPreFusionPasses(),
         "_post_fusion_custom_pass": CustomPostFusionPasses(),
-        "joint_custom_pre_pass": suppress_sfdp,
+        "joint_custom_pre_pass": composed_joint_pre_pass,
         # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
         # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
         "unroll_reductions_threshold": 1,
