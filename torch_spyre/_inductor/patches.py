@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import re
 from contextlib import contextmanager
 from functools import wraps
 
+import regex as re
 import torch
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import ComputedBuffer, MutationLayoutSHOULDREMOVE
@@ -62,22 +62,6 @@ def enable_spyre_context(example_inputs: list[InputType]):
             optimization decisions.
     """
 
-    from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
-
-    # Ensure decorators run (custom ops/lowerings modules)
-    import torch_spyre._inductor.customops  # noqa: F401
-    import torch_spyre._inductor.lowering  # noqa: F401
-    from torch_spyre._inductor.choices import SpyreHeuristics
-    from torch_spyre._inductor.passes import (
-        CustomPreGradPasses,
-        CustomPrePasses,
-        CustomPostPasses,
-        CustomPreFusionPasses,
-        CustomPostFusionPasses,
-        CustomPreSchedulingPasses,
-    )
-    from torch_spyre._inductor.propagate_hints import recover_spyre_hints
-
     # joint_custom_pre_pass fires inside joint_graph_passes() *after*
     # lazy_init() has populated pass_patterns[0] but *before*
     # pass_patterns[0].apply() runs.  That is the first moment the SFDP entries
@@ -97,6 +81,21 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # the CM, so the snapshot captures exactly what the caller intended.
     # The result is always a list for a consistent CustomGraphPassType.
     from torch._inductor.custom_graph_pass import get_custom_graph_passes
+
+    # Ensure decorators run (custom ops/lowerings modules)
+    import torch_spyre._inductor.customops  # noqa: F401
+    import torch_spyre._inductor.lowering  # noqa: F401
+    from torch_spyre._inductor.choices import SpyreHeuristics
+    from torch_spyre._inductor.lowering import enable_spyre_lowerings  # your CM
+    from torch_spyre._inductor.passes import (
+        CustomPostFusionPasses,
+        CustomPostPasses,
+        CustomPreFusionPasses,
+        CustomPreGradPasses,
+        CustomPrePasses,
+        CustomPreSchedulingPasses,
+    )
+    from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
     wrapped_sfdp_entries: list[object] = []
 
