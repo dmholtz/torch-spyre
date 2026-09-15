@@ -8788,6 +8788,85 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, q, k, v, mask, INV_SCALE, run_eager=False)
 
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_manual_masked_attention_mul_scale_dropout_4526(self):
+        """Regression test for issue #4526: mul-scale + dropout variant (patterns 3/4).
+
+        At inference time, dropout is lowered to a clone, leaving:
+            matmul → mul(scale) → clone → softmax → matmul
+        which matches _sfdp_pattern_4_half_inference.  If the graph additionally
+        has an add(mask) between mul and clone, the guard must prevent the match.
+        See: https://github.com/torch-spyre/torch-spyre/issues/4526
+        """
+        torch.manual_seed(0)
+        H, L, D = 8, 128, 64
+        REAL = 89
+        SCALE = D**-0.5
+        q = torch.randn(L, H, D, dtype=torch.float16)
+        k = torch.randn(L, H, D, dtype=torch.float16)
+        v = torch.randn(L, H, D, dtype=torch.float16)
+        q[REAL:] = 8.0
+        k[REAL:] = 8.0
+        v[REAL:] = -8.0
+        neg_inf = torch.finfo(torch.float16).min
+        mask = torch.full((1, 1, L, L), neg_inf, dtype=torch.float16)
+        mask[:, :, :, :REAL] = 0.0
+
+        def fn(q_, k_, v_, mask_, scale):
+            # scores * scale + mask → dropout(p=0) → softmax → SFDP pattern 4
+            qq = q_.unsqueeze(0).transpose(1, 2)
+            kk = k_.unsqueeze(0).transpose(1, 2)
+            vv = v_.unsqueeze(0).transpose(1, 2)
+            scores = torch.matmul(qq, kk.transpose(-2, -1)) * scale + mask_
+            scores = torch.nn.functional.dropout(scores, p=0.0, training=False)
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.matmul(probs, vv)
+            t, h, d = q_.shape
+            return out.transpose(1, 2).reshape(t, h, d)
+
+        self.compare_with_cpu(fn, q, k, v, mask, SCALE, run_eager=False)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_manual_masked_attention_noncontiguous_4526(self):
+        """Regression test for issue #4526: non-contiguous q/k/v variant (pattern 28).
+
+        Pattern 28 is structurally identical to pattern 4 but traced with
+        non-contiguous (strided) q/k/v inputs.  The guard must prevent the
+        pattern from firing when an additive mask is present.
+        See: https://github.com/torch-spyre/torch-spyre/issues/4526
+        """
+        torch.manual_seed(0)
+        H, L, D = 8, 128, 64
+        REAL = 89
+        SCALE = D**-0.5
+        # Non-contiguous layout: oversized allocation, strided slice.
+        q = torch.randn(L, H * 2, D, dtype=torch.float16)[:, :H, :].contiguous()
+        k = torch.randn(L, H * 2, D, dtype=torch.float16)[:, :H, :].contiguous()
+        v = torch.randn(L, H * 2, D, dtype=torch.float16)[:, :H, :].contiguous()
+        q = q.as_strided(q.shape, (H * 2 * D, D, 1))  # introduce non-contiguity
+        k = k.as_strided(k.shape, (H * 2 * D, D, 1))
+        v = v.as_strided(v.shape, (H * 2 * D, D, 1))
+        q[REAL:] = 8.0
+        k[REAL:] = 8.0
+        v[REAL:] = -8.0
+        neg_inf = torch.finfo(torch.float16).min
+        mask = torch.full((1, 1, L, L), neg_inf, dtype=torch.float16)
+        mask[:, :, :, :REAL] = 0.0
+
+        def fn(q_, k_, v_, mask_, scale):
+            # Non-contiguous inputs trigger clone nodes in the graph, matching
+            # pattern 28 (gn-variant of pattern 4).  Mask must still be honoured.
+            qq = q_.unsqueeze(0).transpose(1, 2)
+            kk = k_.unsqueeze(0).transpose(1, 2)
+            vv = v_.unsqueeze(0).transpose(1, 2)
+            scores = torch.matmul(qq, kk.transpose(-2, -1)) * scale + mask_
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.matmul(probs, vv)
+            t, h, d = q_.shape
+            return out.transpose(1, 2).reshape(t, h, d)
+
+        self.compare_with_cpu(fn, q, k, v, mask, SCALE, run_eager=False)
+
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(
     TestOps.PARAMS[("test_large_matmul", "test_mm_relaxed")]["param_sets"]

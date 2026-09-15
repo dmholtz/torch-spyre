@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from contextlib import contextmanager
 from functools import wraps
 
@@ -82,22 +83,30 @@ def enable_spyre_context(example_inputs: list[InputType]):
     # pass_patterns[0].apply() runs.  That is the first moment the SFDP entries
     # exist and can be wrapped.  We call _patch_sfdp_no_mask_checks() here so
     # the mask-guard extra_checks are in place before any pattern is applied.
-    # _patch_sfdp_no_mask_checks() is idempotent (sentinel attribute prevents
-    # double-wrapping), so repeated calls are safe.
+    #
+    # wrapped_sfdp_entries accumulates every PatternEntry wrapped during this
+    # context manager invocation.  These are reverted in the finally block so
+    # that Spyre's guard does not permanently infect pass_patterns[0] and
+    # affect subsequent non-Spyre (e.g. CUDA/CPU) compiles in the same process.
+    #
+    # Any pre-existing joint_custom_pre_pass set on the config before this CM
+    # is entered is preserved by composing it after _ensure_sfdp_patched.
+    # The value is snapshotted here (at CM-entry time) because
+    # torch._inductor.config.patch overwrites it for the duration of the CM;
+    # there is no meaningful window in which a caller would set it again inside
+    # the CM, so the snapshot captures exactly what the caller intended.
+    # The result is always a list for a consistent CustomGraphPassType.
     from torch._inductor.custom_graph_pass import get_custom_graph_passes
+
+    wrapped_sfdp_entries: list[object] = []
+
+    def _ensure_sfdp_patched(_graph):
+        wrapped_sfdp_entries.extend(_patch_sfdp_no_mask_checks())
 
     existing_joint_pre = list(
         get_custom_graph_passes(torch._inductor.config.joint_custom_pre_pass)
     )
-
-    def _ensure_sfdp_patched(_graph):
-        _patch_sfdp_no_mask_checks()
-
-    composed_joint_pre_pass = (
-        [_ensure_sfdp_patched] + existing_joint_pre
-        if existing_joint_pre
-        else _ensure_sfdp_patched
-    )
+    composed_joint_pre_pass: list = [_ensure_sfdp_patched] + existing_joint_pre
 
     # *) Inductor config tweaks (saved/restored)
     new_config = {
@@ -192,6 +201,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         try:
             yield
         finally:
+            _unpatch_sfdp_no_mask_checks(wrapped_sfdp_entries)
             joint_graph.pass_patterns[:] = origin_pass
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
@@ -201,36 +211,84 @@ def enable_spyre_context(example_inputs: list[InputType]):
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"
 
 
+# Additive-mask targets whose output is consumed by softmax — if a scale node
+# inside a no-mask SFDP pattern feeds one of these *outside* the matched set,
+# the graph actually has a mask and the pattern must not fire.
+_ADD_TARGETS = frozenset({
+    torch.ops.aten.add.Tensor,
+    torch.ops.aten.add.Scalar,
+    torch.ops.aten.add_.Tensor,
+    torch.ops.aten.add_.Scalar,
+})
+
+# Scale ops present in the no-mask SFDP patterns being guarded.
+_SCALE_TARGETS = frozenset({
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.div.Tensor,
+})
+
+
 def _no_mask_sfdp_has_mask_add(match) -> bool:
     """Return True if any scale node (mul/div) inside the match feeds an
-    add.Tensor user that lives *outside* the matched node set.
+    add user that lives *outside* the matched node set.
 
-    SFDP no-mask patterns 1 and 2 describe:
-        matmul → (div|mul)(scale) → softmax → matmul
+    No-mask SFDP patterns (1–4, 11, 12, 28) describe:
+        matmul → (div|mul)(scale) [→ optional-cast] → softmax → matmul
     and hardcode attn_mask=None in their replacement.  When the real graph is:
         matmul → (div|mul)(scale) → add(mask) → softmax → matmul
     the add sits outside the matched node set so filter_nodes cannot detect it.
     We inspect the live .users of the matched scale node directly.
+
+    Both add.Tensor (tensor mask) and add.Scalar (scalar bias) are checked.
+    In-place variants (add_.*) are included for completeness, though Inductor
+    typically functionalises them before pattern matching.
     """
-    aten = torch.ops.aten
     matched = set(match.nodes)
     for node in match.nodes:
-        if node.target in (aten.mul.Tensor, aten.div.Tensor):
+        if node.target in _SCALE_TARGETS:
             for user in node.users:
-                if user.target == aten.add.Tensor and user not in matched:
+                if user.target in _ADD_TARGETS and user not in matched:
                     return True
     return False
 
 
 def _wrap_sfdp_no_mask_extra_check(original_extra_check):
-    """Return a wrapped extra_check that vetoes the match when a mask add is present."""
+    """Return a wrapped extra_check that vetoes the match when a mask add is present.
+
+    The original callable is stored on the returned function as
+    ``_spyre_original_extra_check`` so that ``_unpatch_sfdp_no_mask_checks``
+    can restore it when the Spyre compilation context exits.
+    """
 
     def wrapped(match):
         if _no_mask_sfdp_has_mask_add(match):
             return False
         return original_extra_check(match)
 
+    wrapped._spyre_original_extra_check = original_extra_check  # type: ignore[attr-defined]
     return wrapped
+
+
+def _unpatch_sfdp_no_mask_checks(wrapped_entries: list[object]) -> None:
+    """Restore the original extra_check on every entry wrapped in this session.
+
+    Called from the finally block of enable_spyre_context so that Spyre's
+    guard does not permanently mutate the global pass_patterns[0] and affect
+    subsequent non-Spyre (e.g. CUDA/CPU) compiles in the same process.
+    """
+    for entry in wrapped_entries:
+        original = getattr(
+            getattr(entry, "extra_check", None),
+            "_spyre_original_extra_check",
+            None,
+        )
+        if original is not None:
+            entry.extra_check = original  # type: ignore[attr-defined]
+        # Remove the sentinel so a subsequent Spyre compile re-applies the guard.
+        try:
+            delattr(entry, "_spyre_sfdp_patched")  # type: ignore[attr-defined]
+        except AttributeError:
+            pass
 
 
 def patch_inductor_fusions():
@@ -292,31 +350,76 @@ def patch_inductor_fusions():
     GraphTransformObserver.apply_graph_pass = apply_graph_pass
 
 
-def _patch_sfdp_no_mask_checks() -> None:
-    """Wrap the extra_check of SFDP no-mask patterns 1 and 2.
+# Regex matching the pattern_name values of all SFDP no-mask entries that need
+# the mask-add guard.  Patterns 1, 2, 3, 4, 11, 12, 28 all produce
+# sdpa(attn_mask=None) and share the same vulnerable topology:
+#   matmul → (div|mul).Tensor(scale) [→ optional cast] → softmax → matmul
+# Their registered names follow the scheme built by _get_sfdp_patterns():
+#   <base_name>[_half][_bs1]_(inference|training)
+# Pattern 28 uses non-contiguous inputs (gn) but batch_size=2 so no _bs1.
+_SFDP_NO_MASK_RE = re.compile(
+    r"^_sfdp_pattern_(?:1|2|3|4|11|12|28)(_half)?(_bs1)?_(inference|training)$"
+)
 
-    Safe to call multiple times — entries that have already been wrapped are
-    detected and skipped via the _spyre_sfdp_patched sentinel attribute.
+
+def _patch_sfdp_no_mask_checks() -> list[object]:
+    """Wrap the extra_check of SFDP no-mask patterns 1–4, 11, 12, and 28.
+
+    These patterns all replace:
+        matmul → (div|mul)(scale) → [optional cast] → softmax → matmul
+    with sdpa(attn_mask=None).  When the real graph has an additive mask between
+    the scale node and softmax the pattern fires and silently discards the mask.
+
+    Returns the list of PatternEntry objects newly wrapped in this call.
+    Already-wrapped entries are skipped via the _spyre_sfdp_patched sentinel,
+    making repeated calls safe.
+
+    Raises AssertionError if neither any new entries were wrapped nor all
+    matching entries were already wrapped, which indicates that upstream
+    PyTorch has renamed or removed the patterns and the guard needs review.
     Called lazily from enable_spyre_context after lazy_init() has populated
     pass_patterns[0].
     """
-    import re
-
     try:
         from torch._inductor.fx_passes import joint_graph as _jg
-    except Exception:
-        return  # Inductor internals changed — let tests catch it.
+    except ImportError:
+        return []  # Inductor internals changed — let tests catch it.
 
-    sfdp_no_mask_re = re.compile(
-        r"^_sfdp_pattern_[12](_half)?_(inference|training)$"
-    )
+    newly_wrapped: list[object] = []
     for entries in _jg.pass_patterns[0].patterns.values():
         for entry in entries:
             name = getattr(entry, "pattern_name", "") or ""
-            if sfdp_no_mask_re.match(name) and not getattr(
+            if _SFDP_NO_MASK_RE.match(name) and not getattr(
                 entry, "_spyre_sfdp_patched", False
             ):
                 entry.extra_check = _wrap_sfdp_no_mask_extra_check(
                     entry.extra_check
                 )
                 entry._spyre_sfdp_patched = True
+                newly_wrapped.append(entry)
+
+    assert newly_wrapped or _all_sfdp_no_mask_already_patched(_jg), (
+        "Spyre SFDP mask guard: no entries matching the no-mask pattern regex "
+        "were found in pass_patterns[0].  PyTorch may have renamed or removed "
+        "these patterns.  Review _patch_sfdp_no_mask_checks() against the "
+        "current torch._inductor.fx_passes.fuse_attention module.  "
+        "(Issue #4526)"
+    )
+    return newly_wrapped
+
+
+def _all_sfdp_no_mask_already_patched(jg: object) -> bool:
+    """Return True if every entry matching _SFDP_NO_MASK_RE is already wrapped.
+
+    Distinguishes 'nothing to do (all wrapped)' from 'nothing matched (broken)'
+    so the assertion in _patch_sfdp_no_mask_checks can tell them apart.
+    """
+    found_any = False
+    for entries in jg.pass_patterns[0].patterns.values():  # type: ignore[attr-defined]
+        for entry in entries:
+            name = getattr(entry, "pattern_name", "") or ""
+            if _SFDP_NO_MASK_RE.match(name):
+                found_any = True
+                if not getattr(entry, "_spyre_sfdp_patched", False):
+                    return False
+    return found_any
