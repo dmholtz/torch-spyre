@@ -77,6 +77,28 @@ def enable_spyre_context(example_inputs: list[InputType]):
     )
     from torch_spyre._inductor.propagate_hints import recover_spyre_hints
 
+    # joint_custom_pre_pass fires inside joint_graph_passes() *after*
+    # lazy_init() has populated pass_patterns[0] but *before*
+    # pass_patterns[0].apply() runs.  That is the first moment the SFDP entries
+    # exist and can be wrapped.  We call _patch_sfdp_no_mask_checks() here so
+    # the mask-guard extra_checks are in place before any pattern is applied.
+    # _patch_sfdp_no_mask_checks() is idempotent (sentinel attribute prevents
+    # double-wrapping), so repeated calls are safe.
+    from torch._inductor.custom_graph_pass import get_custom_graph_passes
+
+    existing_joint_pre = list(
+        get_custom_graph_passes(torch._inductor.config.joint_custom_pre_pass)
+    )
+
+    def _ensure_sfdp_patched(_graph):
+        _patch_sfdp_no_mask_checks()
+
+    composed_joint_pre_pass = (
+        [_ensure_sfdp_patched] + existing_joint_pre
+        if existing_joint_pre
+        else _ensure_sfdp_patched
+    )
+
     # *) Inductor config tweaks (saved/restored)
     new_config = {
         "split_reductions": False,
@@ -86,6 +108,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         "post_grad_custom_post_pass": CustomPostPasses(),
         "_pre_fusion_custom_pass": CustomPreFusionPasses(),
         "_post_fusion_custom_pass": CustomPostFusionPasses(),
+        "joint_custom_pre_pass": composed_joint_pre_pass,
         # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
         # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580
         "unroll_reductions_threshold": 1,
@@ -178,6 +201,38 @@ def enable_spyre_context(example_inputs: list[InputType]):
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"
 
 
+def _no_mask_sfdp_has_mask_add(match) -> bool:
+    """Return True if any scale node (mul/div) inside the match feeds an
+    add.Tensor user that lives *outside* the matched node set.
+
+    SFDP no-mask patterns 1 and 2 describe:
+        matmul → (div|mul)(scale) → softmax → matmul
+    and hardcode attn_mask=None in their replacement.  When the real graph is:
+        matmul → (div|mul)(scale) → add(mask) → softmax → matmul
+    the add sits outside the matched node set so filter_nodes cannot detect it.
+    We inspect the live .users of the matched scale node directly.
+    """
+    aten = torch.ops.aten
+    matched = set(match.nodes)
+    for node in match.nodes:
+        if node.target in (aten.mul.Tensor, aten.div.Tensor):
+            for user in node.users:
+                if user.target == aten.add.Tensor and user not in matched:
+                    return True
+    return False
+
+
+def _wrap_sfdp_no_mask_extra_check(original_extra_check):
+    """Return a wrapped extra_check that vetoes the match when a mask add is present."""
+
+    def wrapped(match):
+        if _no_mask_sfdp_has_mask_add(match):
+            return False
+        return original_extra_check(match)
+
+    return wrapped
+
+
 def patch_inductor_fusions():
     import torch._inductor.fx_passes.post_grad
 
@@ -199,6 +254,24 @@ def patch_inductor_fusions():
         "Couldn't find addmm fusion. This patch needs to be reviewed."
     )
 
+    # Wrap the extra_check of SFDP no-mask patterns 1 and 2 so they reject
+    # matches where the scale node (mul/div) feeds an add(mask) that is outside
+    # the matched node set.  Without this, _sfdp_pattern_2_half_inference (and
+    # the pattern-1 div-scale variant) silently match masked manual-attention
+    # graphs and replace them with sdpa(attn_mask=None), discarding the mask.
+    #
+    # Patterns 5, 6, etc. already include attn_mask in their pattern graph and
+    # produce the correct sdpa(attn_mask=mask) — they must not be touched.
+    #
+    # lazy_init() inside joint_graph_passes() populates pass_patterns[0] the
+    # first time any joint graph is compiled.  patch_inductor_fusions() is
+    # called at import time, before that, so pass_patterns[0] may be empty
+    # here.  The wrapping is therefore applied lazily from enable_spyre_context
+    # via joint_custom_pre_pass (_ensure_sfdp_patched), which fires after
+    # lazy_init() but before pass_patterns[0].apply().
+    #
+    # See: https://github.com/torch-spyre/torch-spyre/issues/4526
+
     # Install observer patch
     from torch.fx.passes.graph_transform_observer import GraphTransformObserver
 
@@ -217,3 +290,33 @@ def patch_inductor_fusions():
             meta.pop("subsystem", None)
 
     GraphTransformObserver.apply_graph_pass = apply_graph_pass
+
+
+def _patch_sfdp_no_mask_checks() -> None:
+    """Wrap the extra_check of SFDP no-mask patterns 1 and 2.
+
+    Safe to call multiple times — entries that have already been wrapped are
+    detected and skipped via the _spyre_sfdp_patched sentinel attribute.
+    Called lazily from enable_spyre_context after lazy_init() has populated
+    pass_patterns[0].
+    """
+    import re
+
+    try:
+        from torch._inductor.fx_passes import joint_graph as _jg
+    except Exception:
+        return  # Inductor internals changed — let tests catch it.
+
+    sfdp_no_mask_re = re.compile(
+        r"^_sfdp_pattern_[12](_half)?_(inference|training)$"
+    )
+    for entries in _jg.pass_patterns[0].patterns.values():
+        for entry in entries:
+            name = getattr(entry, "pattern_name", "") or ""
+            if sfdp_no_mask_re.match(name) and not getattr(
+                entry, "_spyre_sfdp_patched", False
+            ):
+                entry.extra_check = _wrap_sfdp_no_mask_extra_check(
+                    entry.extra_check
+                )
+                entry._spyre_sfdp_patched = True
