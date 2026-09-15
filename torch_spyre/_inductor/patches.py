@@ -104,21 +104,46 @@ def enable_spyre_context(example_inputs: list[InputType]):
     from torch._inductor.fx_passes import joint_graph
 
     origin_pass = list(joint_graph.pass_patterns)
-    # Disable all joint-graph pass_patterns for Spyre:
-    #   pass_patterns[0] holds the SFDP attention-fusion patterns (patterns 1–30
-    #   from fuse_attention.py).  These rewrites silently drop the additive
-    #   attn_mask when the user writes a manual matmul+mask+softmax+matmul graph
-    #   that is compiled as a single Inductor graph: the no-mask inference variant
-    #   of several patterns (e.g. _sfdp_pattern_2_half_inference) carries no
-    #   _users constraint on the scaled-scores node, so it matches even when that
-    #   node's only user is an add.Tensor(mask), replacing the entire subgraph
-    #   with aten.scaled_dot_product_attention(..., attn_mask=None) and leaving
-    #   the mask add as dead code.  Spyre routes every SDPA call through
-    #   spyre__sdpa_overrideable whose tiled decomposition handles all shapes, so
-    #   the SFDP rewrite provides no benefit and must be suppressed.
-    #   pass_patterns[1] holds the mul/div softmax stability patterns, also
-    #   unsupported on Spyre.
-    joint_graph.pass_patterns.clear()
+    # Disable the SFDP attention-fusion rewrites for Spyre.
+    #
+    # pass_patterns[0] is a shared PatternMatcherPass that holds both the SFDP
+    # attention-fusion patterns (patterns 1–30 from fuse_attention.py) and
+    # several unrelated graph simplifications (pointless_convert, fix_iota_device,
+    # scatter_upon_const_tensor). Clearing the entire pass would suppress those
+    # useful simplifications as a side-effect.
+    #
+    # Instead, surgically remove only the SFDP entries: every SFDP PatternEntry
+    # is a ReplacementPatternEntry whose pattern_name starts with "_sfdp_pattern_".
+    # We snapshot the affected targets and restore them on context exit.
+    #
+    # Why SFDP must be suppressed: the no-mask inference variants (e.g.
+    # _sfdp_pattern_2_half_inference) carry no _users constraint on the
+    # scaled-scores node, so they match a masked manual-attention graph
+    # (matmul → mul → add(mask) → softmax → matmul) and replace it with
+    # aten.scaled_dot_product_attention(..., attn_mask=None), leaving the
+    # mask-add as dead code. Spyre routes every SDPA call through
+    # spyre__sdpa_overrideable whose tiled decomposition handles all shapes,
+    # so the SFDP rewrite yields no performance benefit and must not run.
+    # See: https://github.com/torch-spyre/torch-spyre/issues/4526
+    #
+    # pass_patterns[1] holds the mul/div softmax stability patterns, also
+    # unsupported on Spyre; that entire pass is removed from the list.
+    sfdp_pass = joint_graph.pass_patterns[0]
+    sfdp_snapshot: dict = {}
+    for key, entries in list(sfdp_pass.patterns.items()):
+        sfdp_entries = [
+            e
+            for e in entries
+            if getattr(e, "pattern_name", "").startswith("_sfdp_pattern_")
+        ]
+        if sfdp_entries:
+            sfdp_snapshot[key] = sfdp_entries
+            remaining = [e for e in entries if e not in sfdp_entries]
+            if remaining:
+                sfdp_pass.patterns[key] = remaining
+            else:
+                del sfdp_pass.patterns[key]
+    joint_graph.pass_patterns.pop()
 
     old_update_scheduler = GraphLowering._update_scheduler
 
@@ -183,6 +208,8 @@ def enable_spyre_context(example_inputs: list[InputType]):
             yield
         finally:
             joint_graph.pass_patterns[:] = origin_pass
+            for key, entries in sfdp_snapshot.items():
+                sfdp_pass.patterns[key].extend(entries)
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
