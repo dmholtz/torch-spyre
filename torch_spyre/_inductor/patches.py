@@ -114,7 +114,9 @@ def enable_spyre_context(example_inputs: list[InputType]):
     #
     # Instead, surgically remove only the SFDP entries: every SFDP PatternEntry
     # is a ReplacementPatternEntry whose pattern_name starts with "_sfdp_pattern_".
-    # We snapshot the affected targets and restore them on context exit.
+    # We snapshot the full original bucket (keyed by (op, target)) and restore by
+    # direct assignment on context exit so the operation is idempotent under nested
+    # or sequential re-entry.
     #
     # Why SFDP must be suppressed: the no-mask inference variants (e.g.
     # _sfdp_pattern_2_half_inference) carry no _users constraint on the
@@ -128,22 +130,40 @@ def enable_spyre_context(example_inputs: list[InputType]):
     #
     # pass_patterns[1] holds the mul/div softmax stability patterns, also
     # unsupported on Spyre; that entire pass is removed from the list.
-    sfdp_pass = joint_graph.pass_patterns[0]
-    sfdp_snapshot: dict = {}
-    for key, entries in list(sfdp_pass.patterns.items()):
-        sfdp_entries = [
-            e
-            for e in entries
-            if getattr(e, "pattern_name", "").startswith("_sfdp_pattern_")
-        ]
-        if sfdp_entries:
-            sfdp_snapshot[key] = sfdp_entries
-            remaining = [e for e in entries if e not in sfdp_entries]
-            if remaining:
-                sfdp_pass.patterns[key] = remaining
-            else:
-                del sfdp_pass.patterns[key]
-    joint_graph.pass_patterns.pop()
+    #
+    # Use origin_pass[0] throughout so the restore path operates on the same
+    # object even if pass_patterns is rebuilt between enter and exit.
+    from torch._inductor.pattern_matcher import PatternEntry
+
+    sfdp_pass = origin_pass[0]
+    sfdp_snapshot: dict[
+        tuple[str, torch.fx.node.Target], list[PatternEntry]
+    ] = {}
+    try:
+        for key, entries in list(sfdp_pass.patterns.items()):
+            if any(
+                getattr(e, "pattern_name", "").startswith("_sfdp_pattern_")
+                for e in entries
+            ):
+                # Snapshot the full bucket; restore by direct assignment so
+                # neither ordering nor duplicates can be introduced.
+                sfdp_snapshot[key] = list(entries)
+                remaining = [
+                    e
+                    for e in entries
+                    if not getattr(e, "pattern_name", "").startswith("_sfdp_pattern_")
+                ]
+                if remaining:
+                    sfdp_pass.patterns[key] = remaining
+                else:
+                    del sfdp_pass.patterns[key]
+        joint_graph.pass_patterns.pop()
+    except Exception:
+        # If setup fails partway through, restore whatever we managed to remove
+        # before propagating so no permanent mutation leaks out.
+        for key, entries in sfdp_snapshot.items():
+            sfdp_pass.patterns[key] = entries
+        raise
 
     old_update_scheduler = GraphLowering._update_scheduler
 
@@ -209,7 +229,7 @@ def enable_spyre_context(example_inputs: list[InputType]):
         finally:
             joint_graph.pass_patterns[:] = origin_pass
             for key, entries in sfdp_snapshot.items():
-                sfdp_pass.patterns[key].extend(entries)
+                sfdp_pass.patterns[key] = entries
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
