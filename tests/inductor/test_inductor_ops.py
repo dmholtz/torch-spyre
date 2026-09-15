@@ -8721,8 +8721,9 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         _users constraint on the scaled-scores node, so it matched the masked graph
         and replaced matmul→mul→add(mask)→softmax→matmul with sdpa(attn_mask=None),
         leaving the mask-add as dead code and producing cosine ~0.46 against the
-        correct result. The fix clears all joint_graph pass_patterns for Spyre so no
-        SFDP rewrite can fire.
+        correct result. The fix registers a joint_custom_pre_pass that removes SFDP
+        entries from pass_patterns[0] after lazy_init() populates them but before
+        pass_patterns[0].apply() fires.
         See: https://github.com/torch-spyre/torch-spyre/issues/4526
         """
         import torch.nn.functional as F
