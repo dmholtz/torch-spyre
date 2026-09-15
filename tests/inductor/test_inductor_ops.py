@@ -8714,55 +8714,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         )
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
-    def test_manual_masked_attention_one_graph_4526(self):
-        """Regression test for issue #4526: manual matmul+mask+softmax+matmul in one
-        compiled graph must honour the additive attn_mask.
+    def test_manual_masked_attention_mul_scale_4526(self):
+        """Regression test for issue #4526: manual attention with mul-scaling must
+        honour the additive attn_mask when compiled as one graph.
 
         The SFDP no-mask inference pattern (_sfdp_pattern_2_half_inference) has no
         _users constraint on the scaled-scores node, so it matched the masked graph
-        and replaced matmul→mul→add(mask)→softmax→matmul with sdpa(attn_mask=None),
-        leaving the mask-add as dead code and producing cosine ~0.46 against the
-        correct result. The fix registers a joint_custom_pre_pass that removes SFDP
-        entries from pass_patterns[0] after lazy_init() populates them but before
-        pass_patterns[0].apply() fires.
+        (matmul → mul(scale) → add(mask) → softmax → matmul) and replaced it with
+        sdpa(attn_mask=None), leaving the mask-add as dead code.
         See: https://github.com/torch-spyre/torch-spyre/issues/4526
         """
-        import torch.nn.functional as F
-
-        H, L, D = 8, 128, 64
-        REAL = 89  # live rows; pads carry large values so a dropped mask is visible
-        DTYPE = torch.float16
-        SCALE = D**-0.5
-
         torch.manual_seed(0)
-        q = torch.randn(L, H, D, dtype=DTYPE)
-        k = torch.randn(L, H, D, dtype=DTYPE)
-        v = torch.randn(L, H, D, dtype=DTYPE)
-        # Pad rows: large garbage so a missed mask corrupts real-row output visibly.
+        H, L, D = 8, 128, 64
+        REAL = 89  # real (unpadded) rows; pad rows [REAL:] carry large values
+        SCALE = D**-0.5
+        q = torch.randn(L, H, D, dtype=torch.float16)
+        k = torch.randn(L, H, D, dtype=torch.float16)
+        v = torch.randn(L, H, D, dtype=torch.float16)
+        # Pad rows carry large values so a silently-dropped mask is detectable.
         q[REAL:] = 8.0
         k[REAL:] = 8.0
         v[REAL:] = -8.0
+        neg_inf = torch.finfo(torch.float16).min
+        mask = torch.full((1, 1, L, L), neg_inf, dtype=torch.float16)
+        mask[:, :, :, :REAL] = 0.0
 
-        # Build the padding mask: 0 for real rows, -inf for pad rows.
-        neg_inf = torch.finfo(DTYPE).min
-        kv_ok = torch.arange(L) < REAL
-        row = torch.where(
-            kv_ok,
-            torch.zeros((), dtype=DTYPE),
-            torch.tensor(neg_inf, dtype=DTYPE),
-        )
-        mask = row.unsqueeze(0).expand(L, L).contiguous().unsqueeze(0).unsqueeze(0)
-
-        # CPU float32 reference: attend only over real rows.
-        qs, ks, vs = q[:REAL].float(), k[:REAL].float(), v[:REAL].float()
-        ref_scores = torch.einsum("qhd,khd->hqk", qs, ks) * SCALE
-        ref_probs = torch.softmax(ref_scores, dim=-1)
-        ref = torch.einsum("hqk,khd->qhd", ref_probs, vs)  # [REAL, H, D] fp32
-
-        # One-graph masked attention: QK + mask + softmax + PV all in a single
-        # compiled function.  This is the pattern that triggered the mask drop.
-        def one_graph_masked_attn(q_, k_, v_, mask_, scale):
-            qq = q_.unsqueeze(0).transpose(1, 2)  # [1, H, L, D]
+        def fn(q_, k_, v_, mask_, scale):
+            # scores * scale  → SFDP pattern 2 (mul.Tensor variant)
+            qq = q_.unsqueeze(0).transpose(1, 2)
             kk = k_.unsqueeze(0).transpose(1, 2)
             vv = v_.unsqueeze(0).transpose(1, 2)
             scores = torch.matmul(qq, kk.transpose(-2, -1)) * scale + mask_
@@ -8771,23 +8750,44 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             t, h, d = q_.shape
             return out.transpose(1, 2).reshape(t, h, d)
 
-        compiled_fn = torch.compile(one_graph_masked_attn, dynamic=False)
+        self.compare_with_cpu(fn, q, k, v, mask, SCALE, run_eager=False)
 
-        qd = q.to("spyre")
-        kd = k.to("spyre")
-        vd = v.to("spyre")
-        mask_d = mask.to("spyre")
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_manual_masked_attention_div_scale_4526(self):
+        """Regression test for issue #4526: manual attention with div-scaling must
+        honour the additive attn_mask when compiled as one graph.
 
-        actual = compiled_fn(qd, kd, vd, mask_d, SCALE).cpu().float()[:REAL]
+        Covers the div.Tensor scaling variant (scores / inv_scale + mask), which
+        matches SFDP pattern 5. Both this and the mul-scale variant must survive the
+        SuppressSfdpPass fix without regressing.
+        See: https://github.com/torch-spyre/torch-spyre/issues/4526
+        """
+        torch.manual_seed(0)
+        H, L, D = 8, 128, 64
+        REAL = 89  # real (unpadded) rows; pad rows [REAL:] carry large values
+        INV_SCALE = D**0.5
+        q = torch.randn(L, H, D, dtype=torch.float16)
+        k = torch.randn(L, H, D, dtype=torch.float16)
+        v = torch.randn(L, H, D, dtype=torch.float16)
+        q[REAL:] = 8.0
+        k[REAL:] = 8.0
+        v[REAL:] = -8.0
+        neg_inf = torch.finfo(torch.float16).min
+        mask = torch.full((1, 1, L, L), neg_inf, dtype=torch.float16)
+        mask[:, :, :, :REAL] = 0.0
 
-        cosine = F.cosine_similarity(
-            actual.reshape(-1), ref.reshape(-1), dim=0
-        ).item()
-        assert cosine >= 0.99, (
-            f"Additive attn_mask was silently dropped by the SFDP rewrite "
-            f"(cosine={cosine:.4f}, expected >= 0.99). "
-            "See: https://github.com/torch-spyre/torch-spyre/issues/4526"
-        )
+        def fn(q_, k_, v_, mask_, inv_scale):
+            # scores / inv_scale  → SFDP pattern 5 (div.Tensor variant)
+            qq = q_.unsqueeze(0).transpose(1, 2)
+            kk = k_.unsqueeze(0).transpose(1, 2)
+            vv = v_.unsqueeze(0).transpose(1, 2)
+            scores = torch.matmul(qq, kk.transpose(-2, -1)) / inv_scale + mask_
+            probs = torch.softmax(scores, dim=-1)
+            out = torch.matmul(probs, vv)
+            t, h, d = q_.shape
+            return out.transpose(1, 2).reshape(t, h, d)
+
+        self.compare_with_cpu(fn, q, k, v, mask, INV_SCALE, run_eager=False)
 
 
 _TEST_LARGE_MATMUL_FP32_PROXY_SHAPES = _derive_test_large_matmul_fp32_proxy_shapes(

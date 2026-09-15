@@ -327,7 +327,7 @@ class SuppressSfdpPass(CustomGraphPass):
         self.snapshot: dict = {}
         self._stripped = False
 
-    def __call__(self, graph: torch.fx.graph.Graph) -> None:  # noqa: ARG002
+    def __call__(self, graph: torch.fx.graph.Graph) -> None:
         if self._stripped:
             return
         from torch._inductor.fx_passes import joint_graph as _jg
