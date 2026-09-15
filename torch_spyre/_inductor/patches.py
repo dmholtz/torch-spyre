@@ -104,8 +104,21 @@ def enable_spyre_context(example_inputs: list[InputType]):
     from torch._inductor.fx_passes import joint_graph
 
     origin_pass = list(joint_graph.pass_patterns)
-    # disable mul_softmax_pattern and div_softmax_pattern for now
-    joint_graph.pass_patterns.pop()
+    # Disable all joint-graph pass_patterns for Spyre:
+    #   pass_patterns[0] holds the SFDP attention-fusion patterns (patterns 1–30
+    #   from fuse_attention.py).  These rewrites silently drop the additive
+    #   attn_mask when the user writes a manual matmul+mask+softmax+matmul graph
+    #   that is compiled as a single Inductor graph: the no-mask inference variant
+    #   of several patterns (e.g. _sfdp_pattern_2_half_inference) carries no
+    #   _users constraint on the scaled-scores node, so it matches even when that
+    #   node's only user is an add.Tensor(mask), replacing the entire subgraph
+    #   with aten.scaled_dot_product_attention(..., attn_mask=None) and leaving
+    #   the mask add as dead code.  Spyre routes every SDPA call through
+    #   spyre__sdpa_overrideable whose tiled decomposition handles all shapes, so
+    #   the SFDP rewrite provides no benefit and must be suppressed.
+    #   pass_patterns[1] holds the mul/div softmax stability patterns, also
+    #   unsupported on Spyre.
+    joint_graph.pass_patterns.clear()
 
     old_update_scheduler = GraphLowering._update_scheduler
 
