@@ -1494,13 +1494,13 @@ def _is_frame_changing_clone(op: Operation, buf_name: str) -> bool:
         return False
     rw = op_read_writes(op)
     write = next(
-        (w for w in rw.writes if w.name == buf_name and hasattr(w, "index")), None
+        (w for w in rw.writes if w.name == buf_name and isinstance(w, MemoryDep)), None
     )
     if write is None:
         return False
     read_syms: set = set()
     for r in rw.reads:
-        if hasattr(r, "index"):
+        if isinstance(r, MemoryDep):
             read_syms |= set(r.index.free_symbols)
     # A write-only free symbol means the clone expands (broadcasts) that dim.
     return bool(set(write.index.free_symbols) - read_syms)
@@ -1605,12 +1605,12 @@ def build_residency_edge(
         (
             w
             for w in op_read_writes(parent_op).writes
-            if w.name == buf_name and hasattr(w, "index")
+            if w.name == buf_name and isinstance(w, MemoryDep)
         ),
         None,
     )
     read_dep = next(
-        (r for r in consumer_reads if r.name == buf_name and hasattr(r, "index")),
+        (r for r in consumer_reads if r.name == buf_name and isinstance(r, MemoryDep)),
         None,
     )
     if write_dep is None or read_dep is None:
@@ -2721,7 +2721,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             (
                 dep
                 for dep in op_read_writes(storage_op).writes
-                if dep.name == record.storage_name and hasattr(dep, "index")
+                if dep.name == record.storage_name and isinstance(dep, MemoryDep)
             ),
             None,
         )
@@ -2729,7 +2729,7 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             (
                 dep
                 for dep in op_read_writes(update_op).writes
-                if dep.name == record.update_name and hasattr(dep, "index")
+                if dep.name == record.update_name and isinstance(dep, MemoryDep)
             ),
             None,
         )
@@ -2853,10 +2853,10 @@ class CoOptimizingAllocator(ScratchpadAllocator):
             consumer_divs = divisions[cname]
             rw = op_read_writes(consumer)
             read_dep = next(
-                (r for r in rw.reads if r.name == input_name and hasattr(r, "index")),
+                (r for r in rw.reads if r.name == input_name and isinstance(r, MemoryDep)),
                 None,
             )
-            write = next((w for w in rw.writes if hasattr(w, "index")), None)
+            write = next((w for w in rw.writes if isinstance(w, MemoryDep)), None)
             if read_dep is None or write is None:
                 matches[cname] = []
                 continue
