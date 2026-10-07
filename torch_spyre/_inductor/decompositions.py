@@ -3254,38 +3254,28 @@ def conv2d_via_bmm_decomp(
     H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
     W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
 
-    patches = torch.ops.spyre.unfold(
+    # Single host round trip: unfold the activation, reshape weight and bias
+    # all in one device->host->device pass.  Previously each of those three ops
+    # was an independent spyre::unfold / spyre::reshape_via_cpu call, giving
+    # six boundary crossings (three round trips).  spyre::im2col_prepare fuses
+    # them so only two crossings remain while the matmul and bias-add stay on
+    # Spyre.
+    patches, weight_prep, bias_prep = torch.ops.spyre.im2col_prepare(
         input,
-        kernel_size=(K_h, K_w),
-        dilation=(dil_h, dil_w),
-        padding=(pad_h, pad_w),
-        stride=(stride_h, stride_w),
+        weight,
+        bias,
+        (K_h, K_w),
+        (dil_h, dil_w),
+        (pad_h, pad_w),
+        (stride_h, stride_w),
+        groups,
     )
 
     if groups == 1:
-        # weight_2d = weight.reshape(C_out, C_in_per_group * K_h * K_w)
-        weight_2d = torch.ops.spyre.reshape_via_cpu(
-            weight, (C_out, C_in_per_group * K_h * K_w)
-        )
-        weight_2d_exp = weight_2d.unsqueeze(0).expand(N, -1, -1)
-        weight_2d_exp_cln = weight_2d_exp.clone()
-        # output = torch.matmul(weight_2d, patches)
-        output = torch.matmul(weight_2d_exp_cln, patches)
+        weight_exp = weight_prep.unsqueeze(0).expand(N, -1, -1)
+        output = torch.matmul(weight_exp.clone(), patches)
     else:
-        C_out_per_group = C_out // groups
-        # patches = patches.reshape(N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
-        patches = torch.ops.spyre.reshape_via_cpu(
-            patches, (N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
-        )
-        # weight_grouped = weight.reshape(groups, C_out_per_group, C_in_per_group * K_h * K_w)
-        weight_grouped = torch.ops.spyre.reshape_via_cpu(
-            weight, (groups, C_out_per_group, C_in_per_group * K_h * K_w)
-        )
-
-        output = torch.matmul(
-            weight_grouped.unsqueeze(0),
-            patches,
-        )
+        output = torch.matmul(weight_prep.unsqueeze(0), patches)
         output = output.reshape(N, C_out, H_out * W_out)
 
     if bias is not None:
@@ -3296,8 +3286,8 @@ def conv2d_via_bmm_decomp(
         # instead reshaped to (N, C_out, H_out, W_out) first and broadcast the
         # bias over a sub-stick spatial width (e.g. W_out == 32), the layout
         # solver rejects the resulting `w + 32*Mod(row, 2)` stick expression.
-        bias_shaped = torch.ops.spyre.reshape_via_cpu(bias, (1, C_out, 1))
-        output = output + bias_shaped
+        # bias_prep is (1, C_out, 1) — already reshaped by im2col_prepare.
+        output = output + bias_prep
 
     output = output.reshape(N, C_out, H_out, W_out)
 

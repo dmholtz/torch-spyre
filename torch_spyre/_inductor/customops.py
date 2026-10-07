@@ -625,6 +625,115 @@ def _(
     return input.new_empty((N, C * K_h * K_w, H_out * W_out))
 
 
+@torch.library.custom_op("spyre::im2col_prepare", mutates_args=(), device_types="spyre")
+def spyre_im2col_prepare(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    kernel_size: Sequence[int],
+    dilation: Sequence[int],
+    padding: Sequence[int],
+    stride: Sequence[int],
+    groups: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused host-side im2col prepare for the conv2d_via_bmm decomposition.
+
+    Collapses what were three independent host round trips into one:
+      - input  : (N, C_in, H, W)        -> patches via F.unfold
+      - weight : (C_out, C_in/g, Kh, Kw) -> reshaped for matmul
+      - bias   : (C_out,) or absent      -> reshaped to (1, C_out, 1)
+
+    All three tensors are moved to CPU in one pass and all results are sent
+    back to device in one pass, so the matmul and bias-add stay on Spyre while
+    the number of host/device boundary crossings drops from 6 to 2.
+
+    The bias return tensor has shape (0,) when bias is None; callers check
+    ``bias_out.numel() == 0`` to decide whether to add it.
+
+    groups == 1:
+        weight_out : (C_out, C_in * Kh * Kw)
+        patches    : (N, C_in * Kh * Kw, H_out * W_out)
+    groups > 1:
+        weight_out : (groups, C_out//groups, C_in//groups * Kh * Kw)
+        patches    : (N, groups, C_in//groups * Kh * Kw, H_out * W_out)
+    """
+    warn_fallback("torch.ops.spyre.im2col_prepare")
+
+    K_h, K_w = kernel_size
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_per_group = weight.shape[0], weight.shape[1]
+
+    dil_h, dil_w = dilation
+    pad_h, pad_w = padding
+    stride_h, stride_w = stride
+    H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
+
+    # Single host visit: move all inputs down together.
+    device = input.device
+    input_cpu  = input.to("cpu")
+    weight_cpu = weight.to("cpu")
+    bias_cpu   = bias.to("cpu") if bias is not None else None
+
+    patches_cpu = torch.nn.functional.unfold(
+        input_cpu,
+        kernel_size=kernel_size,
+        dilation=dilation,
+        padding=padding,
+        stride=stride,
+    )
+
+    if groups == 1:
+        weight_out_cpu = weight_cpu.reshape(C_out, C_in_per_group * K_h * K_w)
+    else:
+        C_out_per_group = C_out // groups
+        patches_cpu = patches_cpu.reshape(N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
+        weight_out_cpu = weight_cpu.reshape(groups, C_out_per_group, C_in_per_group * K_h * K_w)
+
+    bias_out_cpu = bias_cpu.reshape(1, C_out, 1) if bias_cpu is not None else torch.empty(0, dtype=input.dtype)
+
+    # Single device upload: send all results back together.
+    return patches_cpu.to(device), weight_out_cpu.to(device), bias_out_cpu.to(device)
+
+
+@spyre_im2col_prepare.register_fake
+def _(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    kernel_size: Sequence[int],
+    dilation: Sequence[int],
+    padding: Sequence[int],
+    stride: Sequence[int],
+    groups: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    K_h, K_w = kernel_size
+    N, C_in, H_in, W_in = input.shape
+    C_out, C_in_per_group = weight.shape[0], weight.shape[1]
+    dil_h, dil_w = dilation
+    pad_h, pad_w = padding
+    stride_h, stride_w = stride
+
+    H_out = (H_in + 2 * pad_h - dil_h * (K_h - 1) - 1) // stride_h + 1
+    W_out = (W_in + 2 * pad_w - dil_w * (K_w - 1) - 1) // stride_w + 1
+
+    if groups == 1:
+        patches_shape = (N, C_in_per_group * K_h * K_w, H_out * W_out)
+        weight_shape  = (C_out, C_in_per_group * K_h * K_w)
+    else:
+        C_out_per_group = C_out // groups
+        patches_shape = (N, groups, C_in_per_group * K_h * K_w, H_out * W_out)
+        weight_shape  = (groups, C_out_per_group, C_in_per_group * K_h * K_w)
+
+    bias_shape = (1, C_out, 1) if bias is not None else (0,)
+
+    return (
+        input.new_empty(patches_shape),
+        weight.new_empty(weight_shape),
+        input.new_empty(bias_shape),
+    )
+
+
 @torch.library.custom_op(
     "spyre::reshape_via_cpu", mutates_args=(), device_types="spyre"
 )
@@ -1358,6 +1467,7 @@ def _(input: torch.Tensor, dim: int, keepdim: bool = False) -> torch.Tensor:
 # dump/restore bracketing). When in doubt, don't mark it.
 mark_lx_safe(torch.ops.spyre.to_dtype_cpu.default)
 mark_lx_safe(torch.ops.spyre.unfold.default)
+mark_lx_safe(torch.ops.spyre.im2col_prepare.default)
 mark_lx_safe(torch.ops.spyre.causal_mask.default)
 mark_lx_safe(torch.ops.spyre.triu_mask.default)
 # max_dim_int64_fallback/min_dim_int64_fallback/max_default_int64_fallback are
